@@ -1,6 +1,6 @@
 ## General
 
-This repository is the `laravel-skir/typescript-client` fork of `gepheum/skir-typescript-client`.
+This repository is the `php-skir/typescript-client` fork of `gepheum/skir-typescript-client`.
 
 Keep upstream compatibility unless a change is explicitly for the Laravel Skir package ecosystem.
 

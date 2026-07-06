@@ -1,5 +1,5 @@
-[![npm](https://img.shields.io/npm/v/@laravel-skir/skir-client)](https://www.npmjs.com/package/@laravel-skir/skir-client)
-[![build](https://github.com/laravel-skir/typescript-client/workflows/Build/badge.svg)](https://github.com/laravel-skir/typescript-client/actions)
+[![npm](https://img.shields.io/npm/v/@php-skir/skir-client)](https://www.npmjs.com/package/@php-skir/skir-client)
+[![build](https://github.com/php-skir/typescript-client/workflows/Build/badge.svg)](https://github.com/php-skir/typescript-client/actions)
 
 # Skir TypeScript Client
 
@@ -7,7 +7,7 @@ Library imported from TypeScript code generated from skir files.
 
 Install with:
 ```shell
-npm i @laravel-skir/skir-client
+npm i @php-skir/skir-client
 ```
 
 ## CBOR transport
