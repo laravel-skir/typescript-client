@@ -1,6 +1,8 @@
+import { decode as decodeCbor, encode as encodeCbor } from "cbor-x";
 import type {
   Express as ExpressApp,
   json as ExpressJson,
+  raw as ExpressRaw,
   Request as ExpressRequest,
   Response as ExpressResponse,
   text as ExpressText,
@@ -2790,6 +2792,36 @@ function toStringImpl<T>(value: T): string {
 /** Metadata of an HTTP request sent by a service client. */
 export type RequestMeta = Omit<RequestInit, "body" | "method">;
 
+/** Wire format used for SkirRPC HTTP request and response bodies. */
+export type TransportCodec = "legacy" | "cbor";
+
+/** Configuration options for a SkirRPC service client. */
+export interface ServiceClientOptions {
+  /**
+   * Codec used for RPC request and response bodies.
+   *
+   * Defaults to `legacy`, which preserves the original Skir colon-separated
+   * request body and JSON response body.
+   */
+  transportCodec?: TransportCodec;
+}
+
+export type RawRequestBody = string | Uint8Array | ArrayBuffer;
+
+function encodeCborJson(value: Json): Uint8Array {
+  const encoded = encodeCbor(value);
+  return new Uint8Array(encoded.buffer, encoded.byteOffset, encoded.byteLength);
+}
+
+function decodeCborJson(value: Uint8Array | ArrayBuffer): Json {
+  const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+  return decodeCbor(bytes) as Json;
+}
+
+function normalizeHeaders(headers: RequestInit["headers"]): Headers {
+  return new Headers(headers);
+}
+
 /** Sends RPCs to a SkirRPC service. */
 export class ServiceClient {
   constructor(
@@ -2797,6 +2829,7 @@ export class ServiceClient {
     private readonly getRequestMetadata: (
       m: Method<unknown, unknown>,
     ) => Promise<RequestMeta> | RequestMeta = (): RequestMeta => ({}),
+    private readonly options: ServiceClientOptions = {},
   ) {
     const url = new URL(serviceUrl);
     if (url.search) {
@@ -2810,26 +2843,52 @@ export class ServiceClient {
     request: Request,
     httpMethod: "GET" | "POST" = "POST",
   ): Promise<Response> {
-    const requestJson = method.requestSerializer.toJsonCode(request);
-    const requestBody = [method.name, method.number, "", requestJson].join(":");
     const requestInit: RequestInit = {
       ...(await Promise.resolve(this.getRequestMetadata(method))),
     };
     const url = new URL(this.serviceUrl);
     requestInit.method = httpMethod;
-    if (httpMethod === "POST") {
-      requestInit.body = requestBody;
+
+    if (this.options.transportCodec === "cbor") {
+      if (httpMethod !== "POST") {
+        throw new Error("CBOR transport only supports POST requests");
+      }
+
+      const headers = normalizeHeaders(requestInit.headers);
+      headers.set("Content-Type", "application/cbor");
+      headers.set("Accept", "application/cbor");
+      requestInit.headers = headers;
+      requestInit.body = encodeCborJson({
+        method: method.name,
+        request: method.requestSerializer.toJson(request, "dense"),
+      });
     } else {
-      url.search = requestBody.replace(/%/g, "%25");
+      const requestJson = method.requestSerializer.toJsonCode(request);
+      const requestBody = [method.name, method.number, "", requestJson].join(
+        ":",
+      );
+      if (httpMethod === "POST") {
+        requestInit.body = requestBody;
+      } else {
+        url.search = requestBody.replace(/%/g, "%25");
+      }
     }
+
     const httpResponse = await fetch(url, requestInit);
     const responseData = await httpResponse.blob();
     if (httpResponse.ok) {
-      const jsonCode = await responseData.text();
-      return method.responseSerializer.fromJsonCode(
-        jsonCode,
-        "keep-unrecognized-values",
-      );
+      if (this.options.transportCodec === "cbor") {
+        return method.responseSerializer.fromJson(
+          decodeCborJson(await responseData.arrayBuffer()),
+          "keep-unrecognized-values",
+        );
+      } else {
+        const jsonCode = await responseData.text();
+        return method.responseSerializer.fromJsonCode(
+          jsonCode,
+          "keep-unrecognized-values",
+        );
+      }
     } else {
       let message = "";
       if (/text\/plain\b/.test(responseData.type)) {
@@ -2842,7 +2901,7 @@ export class ServiceClient {
 
 /** Raw response returned by the server. */
 export interface RawResponse {
-  readonly data: string;
+  readonly data: string | Uint8Array;
   readonly statusCode: number;
   readonly contentType: string;
 }
@@ -2852,6 +2911,14 @@ function makeOkJsonResponse(data: string): RawResponse {
     data: data,
     statusCode: 200,
     contentType: "application/json",
+  };
+}
+
+function makeOkCborResponse(data: Json): RawResponse {
+  return {
+    data: encodeCborJson(data),
+    statusCode: 200,
+    contentType: "application/cbor",
   };
 }
 
@@ -3134,11 +3201,22 @@ export interface RequestHandler<RequestMeta = ExpressRequest> {
    * request's body. The query string is the part of the URL after '?', and it
    * can be decoded with DecodeURIComponent.
    */
-  handleRequest(reqBody: string, reqMeta: RequestMeta): Promise<RawResponse>;
+  handleRequest(
+    reqBody: RawRequestBody,
+    reqMeta: RequestMeta,
+  ): Promise<RawResponse>;
 }
 
 /** Configuration options for a SkirRPC service. */
 export interface ServiceOptions<RequestMeta = ExpressRequest> {
+  /**
+   * Codec used for RPC request and response bodies.
+   *
+   * Defaults to `legacy`, which accepts the original Skir colon-separated
+   * string and JSON-object request formats and returns JSON responses.
+   */
+  transportCodec: TransportCodec;
+
   /**
    * Whether to keep unrecognized values when deserializing requests.
    *
@@ -3266,6 +3344,8 @@ export class Service<RequestMeta = ExpressRequest>
 {
   constructor(options?: Partial<ServiceOptions<RequestMeta>>) {
     this.options = {
+      transportCodec:
+        options?.transportCodec ?? DEFAULT_SERVICE_OPTIONS.transportCodec,
       keepUnrecognizedValues:
         options?.keepUnrecognizedValues ??
         DEFAULT_SERVICE_OPTIONS.keepUnrecognizedValues,
@@ -3297,20 +3377,20 @@ export class Service<RequestMeta = ExpressRequest>
   }
 
   async handleRequest(
-    reqBody: string,
+    reqBody: RawRequestBody,
     reqMeta: RequestMeta,
   ): Promise<RawResponse> {
     return this.doHandleRequest(reqBody, reqMeta, (m) => m);
   }
 
   private async doHandleRequest<OriginalRequestMeta>(
-    reqBody: string,
+    reqBody: RawRequestBody,
     originalReqMeta: OriginalRequestMeta,
     transformReqMeta: (
       m: OriginalRequestMeta,
     ) => RequestMeta | Promise<RequestMeta>,
   ): Promise<RawResponse> {
-    if (reqBody === "list") {
+    if (typeof reqBody === "string" && reqBody === "list") {
       const json = {
         methods: Object.values(this.methodImpls).map((methodImpl) => ({
           method: methodImpl.method.name,
@@ -3323,7 +3403,10 @@ export class Service<RequestMeta = ExpressRequest>
       };
       const jsonCode = JSON.stringify(json, undefined, "  ");
       return makeOkJsonResponse(jsonCode);
-    } else if (reqBody === "" || reqBody === "studio") {
+    } else if (
+      typeof reqBody === "string" &&
+      (reqBody === "" || reqBody === "studio")
+    ) {
       const studioHtml = getStudioHtml(this.options.studioAppJsUrl);
       return makeOkHtmlResponse(studioHtml);
     }
@@ -3334,19 +3417,30 @@ export class Service<RequestMeta = ExpressRequest>
     let format: string;
     let requestData: ["json", Json] | ["json-code", string];
 
-    const firstChar = reqBody.charAt(0);
-    if (/\s/.test(firstChar) || firstChar === "{") {
-      // A JSON object
+    if (this.options.transportCodec === "cbor") {
+      if (typeof reqBody === "string") {
+        return makeBadRequestResponse("bad request: invalid CBOR");
+      }
+
       let reqBodyJson: Json;
       try {
-        reqBodyJson = JSON.parse(reqBody);
+        reqBodyJson = decodeCborJson(reqBody);
       } catch (_e) {
-        return makeBadRequestResponse("bad request: invalid JSON");
+        return makeBadRequestResponse("bad request: invalid CBOR");
       }
+
+      if (
+        typeof reqBodyJson !== "object" ||
+        reqBodyJson === null ||
+        Array.isArray(reqBodyJson)
+      ) {
+        return makeBadRequestResponse("bad request: CBOR body must be a map");
+      }
+
       const methodField = (reqBodyJson as AnyRecord)["method"];
       if (methodField === undefined) {
         return makeBadRequestResponse(
-          "bad request: missing 'method' field in JSON",
+          "bad request: missing 'method' field in CBOR",
         );
       }
       if (typeof methodField === "string") {
@@ -3360,34 +3454,72 @@ export class Service<RequestMeta = ExpressRequest>
           "bad request: 'method' field must be a string or a number",
         );
       }
-      format = "readable";
+      format = "cbor";
       const requestField = (reqBodyJson as AnyRecord)["request"];
       if (requestField === undefined) {
         return makeBadRequestResponse(
-          "bad request: missing 'request' field in JSON",
+          "bad request: missing 'request' field in CBOR",
         );
       }
       requestData = ["json", requestField as Json];
+    } else if (typeof reqBody !== "string") {
+      return makeBadRequestResponse("bad request: invalid request format");
     } else {
-      // A colon-separated string
-      const match = reqBody.match(/^([^:]*):([^:]*):([^:]*):([\S\s]*)$/);
-      if (!match) {
-        return makeBadRequestResponse("bad request: invalid request format");
-      }
-      methodName = match[1]!;
-      const methodNumberStr = match[2]!;
-      format = match[3]!;
-      requestData = ["json-code", match[4]!];
-
-      if (methodNumberStr) {
-        if (!/^-?[0-9]+$/.test(methodNumberStr)) {
+      const firstChar = reqBody.charAt(0);
+      if (/\s/.test(firstChar) || firstChar === "{") {
+        // A JSON object
+        let reqBodyJson: Json;
+        try {
+          reqBodyJson = JSON.parse(reqBody);
+        } catch (_e) {
+          return makeBadRequestResponse("bad request: invalid JSON");
+        }
+        const methodField = (reqBodyJson as AnyRecord)["method"];
+        if (methodField === undefined) {
           return makeBadRequestResponse(
-            "bad request: can't parse method number",
+            "bad request: missing 'method' field in JSON",
           );
         }
-        methodNumber = parseInt(methodNumberStr);
+        if (typeof methodField === "string") {
+          methodName = methodField;
+          methodNumber = undefined;
+        } else if (typeof methodField === "number") {
+          methodName = "?";
+          methodNumber = methodField;
+        } else {
+          return makeBadRequestResponse(
+            "bad request: 'method' field must be a string or a number",
+          );
+        }
+        format = "readable";
+        const requestField = (reqBodyJson as AnyRecord)["request"];
+        if (requestField === undefined) {
+          return makeBadRequestResponse(
+            "bad request: missing 'request' field in JSON",
+          );
+        }
+        requestData = ["json", requestField as Json];
       } else {
-        methodNumber = undefined;
+        // A colon-separated string
+        const match = reqBody.match(/^([^:]*):([^:]*):([^:]*):([\S\s]*)$/);
+        if (!match) {
+          return makeBadRequestResponse("bad request: invalid request format");
+        }
+        methodName = match[1]!;
+        const methodNumberStr = match[2]!;
+        format = match[3]!;
+        requestData = ["json-code", match[4]!];
+
+        if (methodNumberStr) {
+          if (!/^-?[0-9]+$/.test(methodNumberStr)) {
+            return makeBadRequestResponse(
+              "bad request: can't parse method number",
+            );
+          }
+          methodNumber = parseInt(methodNumberStr);
+        } else {
+          methodNumber = undefined;
+        }
       }
     }
 
@@ -3465,17 +3597,22 @@ export class Service<RequestMeta = ExpressRequest>
       }
     }
 
-    let resJson: string;
+    let resJson: Json | string;
     try {
       const flavor = format === "readable" ? "readable" : "dense";
-      resJson = methodImpl.method.responseSerializer.toJsonCode(res, flavor);
+      resJson =
+        format === "cbor"
+          ? methodImpl.method.responseSerializer.toJson(res, "dense")
+          : methodImpl.method.responseSerializer.toJsonCode(res, flavor);
     } catch (e) {
       return makeServerErrorResponse(
         `server error: can't serialize response to JSON: ${e}`,
       );
     }
 
-    return makeOkJsonResponse(resJson);
+    return format === "cbor"
+      ? makeOkCborResponse(resJson as Json)
+      : makeOkJsonResponse(resJson as string);
   }
 
   /**
@@ -3519,7 +3656,7 @@ export class Service<RequestMeta = ExpressRequest>
   ): RequestHandler<OriginalRequestMeta> {
     return {
       handleRequest: async (
-        reqBody: string,
+        reqBody: RawRequestBody,
         reqMeta: OriginalRequestMeta,
       ): Promise<RawResponse> => {
         return this.doHandleRequest(reqBody, reqMeta, transformFn);
@@ -3534,6 +3671,7 @@ export class Service<RequestMeta = ExpressRequest>
 }
 
 const DEFAULT_SERVICE_OPTIONS: ServiceOptions<unknown> = {
+  transportCodec: "legacy",
   keepUnrecognizedValues: false,
   canSendUnknownErrorMessage: false,
   errorLogger: (errorInfo: MethodErrorInfo<unknown, unknown>) => {
@@ -3554,23 +3692,26 @@ export function installServiceOnExpressApp(
   service: RequestHandler<ExpressRequest>,
   text: typeof ExpressText,
   json: typeof ExpressJson,
+  raw?: typeof ExpressRaw,
 ): void {
   const callback = async (
     req: ExpressRequest,
     res: ExpressResponse,
   ): Promise<void> => {
-    let body: string;
+    let body: RawRequestBody;
     const indexOfQuestionMark = req.originalUrl.indexOf("?");
     if (indexOfQuestionMark >= 0) {
       const queryString = req.originalUrl.substring(indexOfQuestionMark + 1);
       body = decodeURIComponent(queryString);
     } else {
       body =
-        typeof req.body === "string"
+        req.body instanceof Uint8Array
           ? req.body
-          : typeof req.body === "object"
-            ? JSON.stringify(req.body)
-            : "";
+          : typeof req.body === "string"
+            ? req.body
+            : typeof req.body === "object"
+              ? JSON.stringify(req.body)
+              : "";
     }
     const rawResponse = await service.handleRequest(body, req);
     res
@@ -3579,7 +3720,10 @@ export function installServiceOnExpressApp(
       .send(rawResponse.data);
   };
   app.get(queryPath, callback);
-  app.post(queryPath, text(), json(), callback);
+  const middleware = raw
+    ? [text(), json(), raw({ type: "application/cbor" }), callback]
+    : [text(), json(), callback];
+  app.post(queryPath, ...middleware);
 }
 
 // =============================================================================

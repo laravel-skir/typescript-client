@@ -1,7 +1,102 @@
 import { expect } from "buckwheat";
+import { decode, encode } from "cbor-x";
 import { describe, it } from "mocha";
 import { SerializerTester } from "./serializer_tester.js";
 import * as skir from "./skir-client.js";
+
+const squareMethod: skir.Method<number, number> = {
+  name: "Square",
+  number: 1001,
+  requestSerializer: skir.primitiveSerializer("int32"),
+  responseSerializer: skir.primitiveSerializer("int32"),
+  doc: "",
+};
+
+describe("ServiceClient CBOR transport", () => {
+  it("sends a CBOR request envelope and decodes a CBOR response", async () => {
+    const originalFetch = globalThis.fetch;
+    const requests: {
+      url: string;
+      init: RequestInit | undefined;
+      decodedBody: unknown;
+    }[] = [];
+
+    globalThis.fetch = async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      expect(input.toString()).toBe("https://example.com/rpc");
+      expect(init?.method).toBe("POST");
+      const headers = new Headers(init?.headers);
+      expect(headers.get("Content-Type")).toBe("application/cbor");
+      expect(headers.get("Accept")).toBe("application/cbor");
+
+      const body = init?.body;
+      if (!(body instanceof Uint8Array)) {
+        throw new Error("expected Uint8Array request body");
+      }
+
+      requests.push({
+        url: input.toString(),
+        init: init,
+        decodedBody: decode(body),
+      });
+
+      return new Response(encode(49), {
+        status: 200,
+        headers: { "Content-Type": "application/cbor" },
+      });
+    };
+
+    try {
+      const client = new skir.ServiceClient(
+        "https://example.com/rpc",
+        undefined,
+        { transportCodec: "cbor" },
+      );
+
+      expect(await client.invokeRemote(squareMethod, 7)).toBe(49);
+      expect(
+        requests.map((request) => ({
+          url: request.url,
+          decodedBody: request.decodedBody,
+        })),
+      ).toMatch([
+        {
+          url: "https://example.com/rpc",
+          decodedBody: {
+            method: "Square",
+            request: 7,
+          },
+        },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("Service CBOR transport", () => {
+  it("handles a CBOR request envelope and returns a CBOR response", async () => {
+    const service = new skir.Service<unknown>({ transportCodec: "cbor" });
+    service.addMethod(squareMethod, async (request): Promise<number> => {
+      return request * request;
+    });
+
+    const response = await service.handleRequest(
+      encode({
+        method: "Square",
+        request: 8,
+      }),
+      {},
+    );
+
+    expect(response.statusCode).toBe(200);
+    expect(response.contentType).toBe("application/cbor");
+    expect(response.data instanceof Uint8Array).toBe(true);
+    expect(decode(response.data as Uint8Array)).toBe(64);
+  });
+});
 
 describe("Timestamp", () => {
   it("#MIN is min timestamp rerpresentable as Date objects", () => {

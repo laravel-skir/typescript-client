@@ -10,6 +10,29 @@ Install with:
 npm i @laravel-skir/skir-client
 ```
 
+## CBOR transport
+
+The default SkirRPC transport stays compatible with upstream Skir. To exchange
+CBOR request and response bodies, opt in on both the client and service:
+
+```typescript
+const client = new ServiceClient("https://example.com/rpc", undefined, {
+  transportCodec: "cbor",
+});
+
+const service = new Service({ transportCodec: "cbor" });
+```
+
+CBOR transport sends a `{ method, request }` envelope as `application/cbor` and
+encodes the response value as `application/cbor`.
+
+When installing a CBOR-enabled service on Express, pass Express's `raw`
+middleware as the sixth argument:
+
+```typescript
+installServiceOnExpressApp(app, "/rpc", service, text, json, raw);
+```
+
 See:
 
 *   [skir](https://github.com/gepheum/skir): home of the skir compiler

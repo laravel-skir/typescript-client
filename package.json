@@ -60,6 +60,7 @@
     "serialize-javascript": "^7.0.4"
   },
   "dependencies": {
-    "@types/express": "^5.0.1"
+    "@types/express": "^5.0.1",
+    "cbor-x": "^1.6.4"
   }
 }
